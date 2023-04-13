@@ -29,6 +29,13 @@ from .losses import compute_target
 from .connection import MultiProcessJobExecutor
 from .worker import WorkerCluster, WorkerServer
 
+import wandb
+import os
+
+# Set up Weights & Biases
+run = wandb.init(project='hungry_geese_wandb')
+SAVE_FREQUENCY = 1
+
 
 def make_batch(episodes, args):
     """Making training batch
@@ -400,6 +407,132 @@ class Trainer:
             self.update_queue.put((model, self.steps))
         print('finished training')
 
+import numpy as np
+from PIL import Image, ImageDraw
+from kaggle_environments import make
+
+from PIL import ImageColor
+
+def create_board_image(board, cell_size=20, goose_colors=None, food_color='purple'):
+    rows, cols = len(board), len(board[0])
+    img = Image.new('RGB', (cols * cell_size, rows * cell_size), color='white')
+    draw = ImageDraw.Draw(img)
+
+    if goose_colors is None:
+        goose_colors = ['red', 'green', 'blue', 'yellow']
+
+    food_positions = []
+
+    for row in range(rows):
+        for col in range(cols):
+            cell = board[row][col]
+            if cell == -1:
+                draw.rectangle([(col * cell_size, row * cell_size), ((col + 1) * cell_size, (row + 1) * cell_size)], fill='black')
+            elif cell >= 0:
+                base_color = ImageColor.getrgb(goose_colors[cell % len(goose_colors)])
+                alpha = int(255 * (1 - (cell - int(cell))))
+                color = tuple(int(c * alpha / 255) for c in base_color)
+                draw.rectangle([(col * cell_size, row * cell_size), ((col + 1) * cell_size, (row + 1) * cell_size)], fill=color)
+            elif cell == -2:
+                food_positions.append((row, col))
+
+    for pos in food_positions:
+        row, col = pos
+        draw.ellipse([(col * cell_size, row * cell_size), ((col + 1) * cell_size, (row + 1) * cell_size)], fill=food_color)
+
+    return img
+
+
+
+def state_to_board(state, config):
+    rows, cols = config["rows"], config["columns"]
+    board = np.full((rows, cols), -1, dtype=int)
+
+    for index, goose in enumerate(state[0]["observation"]["geese"]):
+        for pos in goose:
+            row, col = pos // cols, pos % cols
+            board[row][col] = index
+
+    for pos in state[0]["observation"]["food"]:
+        row, col = pos // cols, pos % cols
+        board[row][col] = -2
+
+    return board
+
+
+def game_to_gif(frames, output_path, duration=500, loop=0):
+    frames[0].save(output_path, format='GIF', append_images=frames[1:], save_all=True, duration=duration, loop=loop)
+
+def play_and_create_gif(agent, output_path, cell_size=20, goose_colors=None, duration=500, loop=0):
+    env = make("hungry_geese")
+    env.reset(num_agents=4)
+    frames = []
+
+    while not env.done:
+        actions = [agent(obs_to_agent_input(env.state[i], env.state[0]), env.state) for i in range(4)]
+        env.step(actions)
+        board = state_to_board(env.state, env.configuration)
+        img = create_board_image(board, cell_size=cell_size, goose_colors=goose_colors)
+        frames.append(img)
+
+
+    game_to_gif(frames, output_path, duration=duration, loop=loop)
+
+
+def obs_to_agent_input(state, full_state):
+    geese = full_state["observation"]["geese"]
+    food = full_state["observation"]["food"]
+    index = state["observation"]["index"]
+    remaining_time = state["observation"]["remainingOverageTime"]
+
+    return {
+        "geese": geese,
+        "food": food,
+        "index": index,
+        "remainingOverageTime": remaining_time
+    }
+
+    
+import importlib.util
+import sys
+import os
+
+def load_agent_from_file(file_path):
+    module_name = os.path.splitext(os.path.basename(file_path))[0]
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    agent_module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = agent_module
+    spec.loader.exec_module(agent_module)
+    return agent_module.agent
+
+def create_gif_from_submission(submission_path, output_gif_path):
+    # エージェントをファイルから読み込む
+    agent = load_agent_from_file(submission_path)
+
+    # ゲームをプレイしてGIFを生成
+    play_and_create_gif(agent, output_gif_path)
+
+import base64
+import torch
+import os
+import pickle
+
+def model_weights_to_base64(model_path):
+    model = torch.load(model_path)
+    model_data = pickle.dumps(model)
+    encoded_weights = base64.b64encode(model_data).decode("utf-8")
+    return encoded_weights
+
+def create_submission_file(model_path, base_file_path, output_path):
+    encoded_weights = model_weights_to_base64(model_path)
+    with open(base_file_path, "r") as base_file:
+        base_content = base_file.read()
+    with open(output_path, "w") as f:
+        f.write(f"PARAM = '{encoded_weights}'\n")
+        f.write("\n")
+        f.write(base_content)
+
+
 
 class Learner:
     def __init__(self, args, net=None, remote=False):
@@ -512,6 +645,25 @@ class Learner:
                 mean = r / (n + 1e-6)
                 name_tag = ' (%s)' % name if name != '' else ''
                 print('win rate%s = %.3f (%.1f / %d)' % (name_tag, (mean + 1) / 2, (r + n) / 2, n))
+                
+                #if (self.model_epoch % SAVE_FREQUENCY == 0)&(self.model_epoch>0):  # added this part
+                if self.model_epoch>0:
+                    current_epoch = self.model_epoch
+                    current_model_path = self.latest_model_path()
+                    # Log the artifact to Weights & Biases
+                    artifact = wandb.Artifact(f'{current_epoch}.pt', type="model")
+                    artifact.add_file(current_model_path, name=f'{current_epoch}.pt')
+                    run.log_artifact(artifact) 
+                    print('model sent to wandb as an artifact')
+
+                    create_submission_file(current_model_path, './base.py', f'./agents/{current_epoch}.py') # .pt -> .py
+                    create_gif_from_submission(f'./agents/{current_epoch}.py', f'./videos/{current_epoch}.gif') # generate gif anime
+                    run.log(
+                        {
+                            'win_rate': (mean + 1) / 2, 
+                            "visualized episode": wandb.Video(f'./videos/{current_epoch}.gif', fps=2, format="gif")
+                        }
+                    ) # send it to wandb
 
             keys = self.results_per_opponent[self.model_epoch]
             if len(self.args.get('eval', {}).get('opponent', [])) <= 1 and len(keys) <= 1:
