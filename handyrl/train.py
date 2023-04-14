@@ -33,8 +33,8 @@ import wandb
 import os
 
 # Set up Weights & Biases
-run = wandb.init(project='hungry_geese_wandb')
-SAVE_FREQUENCY = 1
+#run = wandb.init(project='hungry_geese_wandb')
+#SAVE_FREQUENCY = 1
 
 
 def make_batch(episodes, args):
@@ -549,6 +549,7 @@ class Learner:
         self.eval_rate = max(args['eval_rate'], eval_modify_rate)
         self.shutdown_flag = False
         self.flags = set()
+        self.win_rate = 0
 
         # trained datum
         self.model_epoch = self.args['restart_epoch']
@@ -645,6 +646,7 @@ class Learner:
                 mean = r / (n + 1e-6)
                 name_tag = ' (%s)' % name if name != '' else ''
                 print('win rate%s = %.3f (%.1f / %d)' % (name_tag, (mean + 1) / 2, (r + n) / 2, n))
+                self.win_rate = (mean + 1) / 2
                 
                 #if (self.model_epoch % SAVE_FREQUENCY == 0)&(self.model_epoch>0):  # added this part
                 if self.model_epoch>0:
@@ -653,12 +655,12 @@ class Learner:
                     # Log the artifact to Weights & Biases
                     artifact = wandb.Artifact(f'{current_epoch}.pt', type="model")
                     artifact.add_file(current_model_path, name=f'{current_epoch}.pt')
-                    run.log_artifact(artifact) 
+                    wandb.log_artifact(artifact) 
                     print('model sent to wandb as an artifact')
 
                     create_submission_file(current_model_path, './base.py', f'./agents/{current_epoch}.py') # .pt -> .py
                     create_gif_from_submission(f'./agents/{current_epoch}.py', f'./videos/{current_epoch}.gif') # generate gif anime
-                    run.log(
+                    wandb.log(
                         {
                             'win_rate': (mean + 1) / 2, 
                             "visualized episode": wandb.Video(f'./videos/{current_epoch}.gif', fps=2, format="gif")
@@ -783,6 +785,7 @@ class Learner:
         # open generator, evaluator
         self.worker.run()
         self.server()
+        
 
 
 def train_main(args):
@@ -790,6 +793,16 @@ def train_main(args):
     learner = Learner(args=args)
     learner.run()
 
+def train_main2(env_args, train_args):
+    run = wandb.init(config=train_args)
+    args = {}
+    args['env_args'] = env_args
+    args['train_args'] = train_args
+    prepare_env(args['env_args'])  # preparing environment is needed in stand-alone mode
+    learner = Learner(args=args)
+    learner.run()
+    
+    return learner.win_rate
 
 def train_server_main(args):
     learner = Learner(args=args, remote=True)
